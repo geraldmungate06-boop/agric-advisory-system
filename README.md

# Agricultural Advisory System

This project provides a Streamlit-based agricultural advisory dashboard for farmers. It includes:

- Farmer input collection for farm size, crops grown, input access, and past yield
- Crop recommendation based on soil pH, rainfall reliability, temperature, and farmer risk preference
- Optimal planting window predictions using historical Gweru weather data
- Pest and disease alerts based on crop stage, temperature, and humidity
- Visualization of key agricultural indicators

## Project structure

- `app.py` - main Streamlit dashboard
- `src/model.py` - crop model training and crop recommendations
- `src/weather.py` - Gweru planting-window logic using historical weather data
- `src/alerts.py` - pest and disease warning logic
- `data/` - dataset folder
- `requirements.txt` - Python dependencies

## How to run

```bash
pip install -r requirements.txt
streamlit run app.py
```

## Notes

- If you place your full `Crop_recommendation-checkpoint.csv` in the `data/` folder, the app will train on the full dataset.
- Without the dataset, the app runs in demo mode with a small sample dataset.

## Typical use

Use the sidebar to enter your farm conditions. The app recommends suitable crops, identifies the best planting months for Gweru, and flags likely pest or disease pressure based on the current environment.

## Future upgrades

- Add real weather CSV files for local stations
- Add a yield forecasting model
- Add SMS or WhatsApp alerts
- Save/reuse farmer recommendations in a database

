@@ -1,0 +1,138 @@
+import streamlit as st
+import pandas as pd
+from pathlib import Path
+
+from src.model import build_model, derive_farm_features, recommend_crops, load_dataset
+from src.weather import fetch_gweru_weather, get_optimal_planting_windows
+from src.alerts import evaluate_alert
+
+DATA_PATH = Path("data/Crop_recommendation-checkpoint.csv")
+
+
+@st.cache_resource
+def get_crop_model():
+    if DATA_PATH.exists():
+        frame = load_dataset(DATA_PATH)
+        if "label" in frame.columns:
+            return build_model(frame), frame
+
+    demo_frame = pd.DataFrame(
+        [
+            {"N": 90, "P": 42, "K": 43, "temperature": 20.9, "humidity": 82.0, "ph": 6.5, "rainfall": 202.9, "label": "rice"},
+            {"N": 67, "P": 60, "K": 25, "temperature": 29.5, "humidity": 62.0, "ph": 6.8, "rainfall": 105.0, "label": "maize"},
+            {"N": 24, "P": 32, "K": 34, "temperature": 28.5, "humidity": 58.0, "ph": 6.1, "rainfall": 90.0, "label": "chickpea"},
+            {"N": 116, "P": 20, "K": 26, "temperature": 25.6, "humidity": 55.0, "ph": 6.8, "rainfall": 160.0, "label": "coffee"},
+            {"N": 30, "P": 12, "K": 22, "temperature": 31.2, "humidity": 91.0, "ph": 6.4, "rainfall": 170.0, "label": "orange"},
+            {"N": 89, "P": 40, "K": 44, "temperature": 25.2, "humidity": 74.0, "ph": 6.9, "rainfall": 180.0, "label": "jute"},
+            {"N": 120, "P": 30, "K": 35, "temperature": 27.1, "humidity": 54.0, "ph": 6.5, "rainfall": 175.0, "label": "banana"},
+            {"N": 18, "P": 18, "K": 33, "temperature": 28.0, "humidity": 93.0, "ph": 6.2, "rainfall": 140.0, "label": "mango"},
+        ]
+    )
+    return build_model(demo_frame), demo_frame
+
+
+st.set_page_config(page_title="Agri Advisory System", layout="wide")
+
+
+st.title("Agri Advisory System")
+st.caption("Crop recommendation, planting window planning, pest alerting, and dashboard visualization for Gweru")
+
+model, df = get_crop_model()
+
+if not DATA_PATH.exists():
+    st.warning("Crop dataset was not found. The app loaded a demo dataset for preview. Add your full Crop_recommendation-checkpoint.csv to the data folder for production results.")
+
+with st.sidebar:
+    st.header("Farmer Inputs")
+    farm_size = st.number_input("Farm size (hectares)", min_value=0.5, value=12.0, step=0.5)
+    crops_grown = st.text_input("Crops grown", value="maize")
+    input_access = st.selectbox("Input access", ["Low", "Medium", "High"]) 
+    past_yield = st.number_input("Past yield (t/ha)", min_value=0.5, value=2.5, step=0.5)
+    soil_ph = st.number_input("Soil pH", min_value=3.0, max_value=10.0, value=6.5, step=0.1)
+    rainfall_reliability = st.slider("Rainfall reliability (%)", min_value=20, max_value=100, value=72)
+    temperature = st.slider("Temperature (°C)", min_value=10, max_value=45, value=27)
+    risk_preference = st.selectbox("Risk preference", ["Low", "Medium", "High"])
+    crop_stage = st.selectbox("Crop growth stage", ["Early", "Vegetative", "Flowering", "Maturity"])
+    humidity = st.slider("Humidity (%)", min_value=20, max_value=100, value=70)
+
+features = derive_farm_features(
+    soil_ph=soil_ph,
+    rainfall_reliability=rainfall_reliability,
+    temperature=temperature,
+    risk_preference=risk_preference,
+    input_access=input_access,
+    past_yield=past_yield,
+    farm_size=farm_size,
+)
+
+result = recommend_crops(model, features)
+alert_status = evaluate_alert(crops_grown, temperature, humidity, crop_stage)
+
+
+metrics_col1, metrics_col2, metrics_col3, metrics_col4 = st.columns(4)
+metrics_col1.metric("Farm Size", f"{farm_size} ha")
+metrics_col2.metric("Input Access", input_access)
+metrics_col3.metric("Past Yield", f"{past_yield} t/ha")
+metrics_col4.metric("Risk Preference", risk_preference)
+
+
+crop_tab, window_tab, alert_tab, chart_tab = st.tabs(["Crop Recommendation", "Planting Window", "Pest & Disease Alerts", "Visualization"])
+
+with crop_tab:
+    st.subheader("Recommended crops")
+    top_rec = result[0]
+    st.success(f"Top recommendation: {top_rec['crop']} ({top_rec['score'] * 100:.1f}% confidence)")
+
+    for item in result:
+        st.write(f"- {item['crop']}: {item['score'] * 100:.1f}%")
+
+    st.info(
+        f"These recommendations use soil pH {soil_ph}, rainfall reliability {rainfall_reliability}%, "
+        f"temperature {temperature}°C, and risk preference '{risk_preference}'."
+    )
+
+with window_tab:
+    st.subheader("Optimal planting windows in Gweru")
+    weather_df = fetch_gweru_weather()
+
+    if weather_df.empty:
+        st.warning("Could not fetch historical Gweru weather data. Please check your internet connection or add a local weather csv.")
+    else:
+        windows = get_optimal_planting_windows(weather_df)
+        if windows.empty:
+            st.warning("No valid weather windows were found.")
+        else:
+            st.dataframe(windows, use_container_width=True)
+
+            chart_data = windows[["month_name", "rainfall", "mean_temp"]].copy()
+            chart_data = chart_data.rename(columns={"month_name": "Month", "rainfall": "Rainfall (mm)", "mean_temp": "Mean Temp (°C)"})
+            st.bar_chart(chart_data.set_index("Month"))
+
+with alert_tab:
+    st.subheader("Pest and disease monitoring")
+    st.write(f"Crop: {crops_grown}")
+    st.write(f"Crop stage: {crop_stage}")
+    st.write(f"Temperature: {temperature}°C")
+    st.write(f"Humidity: {humidity}%")
+
+    if alert_status == "High":
+        st.error("High risk: field monitoring and plant protection treatment are recommended.")
+    elif alert_status == "Moderate":
+        st.warning("Moderate risk: inspect field regularly and reduce favorable disease conditions.")
+    else:
+        st.success("Low risk: conditions are relatively favorable for this crop.")
+
+with chart_tab:
+    st.subheader("Decision visualization")
+    dashboard_df = pd.DataFrame(
+        {
+            "Variable": ["Soil pH", "Rainfall Reliability", "Temperature", "Humidity"],
+            "Value": [soil_ph, rainfall_reliability, temperature, humidity],
+        }
+    )
+    st.bar_chart(dashboard_df.set_index("Variable"))
+
+    if df is not None:
+        label_counts = df["label"].value_counts().head(10)
+        st.subheader("Crop distribution in dataset")
+        st.bar_chart(label_counts)
